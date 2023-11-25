@@ -10,8 +10,13 @@ const port = process.env.PORT || 5000;
 
 // Middlewares: Enable CORS and parse JSON in the request body
 app.use(cors());
-app.use(express.json());
 
+app.use(express.json()); // Make sure you have this middleware to parse JSON
+
+app.use((req, res, next) => {
+  console.log(req.body); // Log the request body
+  next();
+});
 // MongoDB connection URI with credentials from environment variables
 const uri = `mongodb+srv://${process.env.USER}:${process.env.PASS}@cluster0.rrl4awm.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -28,7 +33,23 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the MongoDB client to the server
-    await client.connect();
+    // await client.connect();
+
+
+
+    // Send a ping to confirm a successful connection
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
+  } finally {
+    // Close the MongoDB client when done (commented out for now)
+    // await client.close();
+  }
+}
+
+// Call the run function and handle errors
+run().catch(console.dir);
+
+
 
     // Get collections from the BistroDB database
     const menuCollection = client.db("BistroDB").collection("menu");
@@ -61,17 +82,17 @@ async function run() {
     };
 
     // Middleware to verify if the user is an admin
+   
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded.email;
       const query = { email: email };
       const user = await userCollection.findOne(query);
-      const isAdmin = user?.role === 'admin';
+      const isAdmin = user?.role === "admin";
       if (!isAdmin) {
-        return res.status(403).send({ message: 'Forbidden access' });
+        return res.status(403).send({ message: 'forbidden access' });
       }
       next();
-    };
-
+    }
     // Users related API endpoints
     app.post("/users", async (req, res) => {
       const user = req.body;
@@ -102,14 +123,14 @@ async function run() {
       const filter = { _id: new ObjectId(id) };
       const updatedDoc = {
         $set: {
-          role: 'admin'
+          role: "admin"
         }
       }
       const result = await userCollection.updateOne(filter, updatedDoc);
       res.send(result)
     });
 
-    app.get('/users/admin/:email', verifyToken, verifyAdmin, async (req, res) => {
+    app.get('/users/admin/:email', verifyToken,  async (req, res) => {
       const email = req.params.email;
       if (email !== req.decoded.email) {
         return res.status(403).send({ message: 'Forbidden access' })
@@ -118,7 +139,7 @@ async function run() {
       const user = await userCollection.findOne(query);
       let admin = false;
       if (user) {
-        admin = user?.role === 'admin';
+        admin = user?.role === "admin";
       }
       res.send({ admin })
     });
@@ -216,6 +237,15 @@ async function run() {
     });
 
     //payment related api
+    app.get('/payments/:email', verifyToken, async (req, res) => {
+      const query = { email: req.params.email }
+      if (req.params.email !== req.decoded.email) {
+        return res.status(403).send({ message: 'forbidden access' });
+      }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    })
+
     app.post('/payments', async(req,res)=>{
       const payment = req.body;
       const paymentResult = await paymentCollection.insertOne(payment);
@@ -226,20 +256,104 @@ async function run() {
       }}
       const deleteResult = await cartsCollection.deleteMany(query)
       res.send({paymentResult,deleteResult})
+    });
+
+    //stats or analytics
+    app.get('/admin-stats',verifyToken,verifyAdmin, async(req,res)=>{
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      //this is not the best way 
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, payment)=> total + payment.price,0);
+      const result = await paymentCollection.aggregate([
+        {
+           $group:{
+            _id: null,
+            totalRevenue:{
+              $sum:'$price'
+            }
+           }
+
+        }
+      ]).toArray();
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+      res.send({users,
+         menuItems,
+         orders,
+         revenue
+
+        })
     })
 
-    // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
-    // Close the MongoDB client when done (commented out for now)
-    // await client.close();
-  }
-}
+    //Order Status 
 
-// Call the run function and handle errors
-run().catch(console.dir);
+    /**
+     * -----------------------
+     * NON-Efficient Way
+     * -----------------------
+     * 1. Load all the payments
+     * 2. for every menuItems is  (which is an array), go find the item from menu collection 
+     * 3. for every item in  the menu collection that  you found from a payment entry (document)
+     */
 
+    //using aggregate pipeline
+    app.get('/order-stats',verifyToken,verifyAdmin, async (req, res) => {
+      try {
+        const beforeLookup = await paymentCollection.countDocuments();
+        console.log('Before $lookup:', beforeLookup);
+    
+        const result = await paymentCollection.aggregate([
+          {
+            $lookup: {
+              from: 'menu',
+              localField: 'menuItemIds',
+              foreignField: '_id',
+              as: 'menuItems'
+            }
+          },
+          {
+            $unwind: '$menuItems'
+          },
+          {
+            $match: {
+              'menuItems.category': { $exists: true }
+            }
+          },
+          {
+            $group: {
+              _id: '$menuItems.category',
+              quantity: {
+                $sum: 1
+              },
+              revenue: {
+                $sum: '$menuItems.price'
+              }
+            }
+          },
+          {
+            $project:{
+              _id: 0,
+              category:'$_id',
+              quantity: '$quantity',
+              revenue: '$revenue'
+            }
+          }
+        ]).toArray();
+    
+        console.log(result);
+    
+        const afterLookup = await paymentCollection.countDocuments();
+        console.log('After $lookup:', afterLookup);
+    
+        res.send(result);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send('Internal Server Error');
+      }
+    });
+    
 // Default route to confirm the server is running
 app.get('/', (req, res) => [
   res.send("Bistro Boss Server is running")
